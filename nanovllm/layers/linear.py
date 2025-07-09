@@ -51,7 +51,7 @@ class ReplicatedLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
-
+# 列并行线性层
 class ColumnParallelLinear(LinearBase):
 
     def __init__(
@@ -65,7 +65,9 @@ class ColumnParallelLinear(LinearBase):
         self.output_size_per_partition = divide(output_size, self.tp_size)
 
         self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, self.input_size))
+
         self.weight.weight_loader = self.weight_loader
+
         if bias:
             self.bias = nn.Parameter(torch.empty(self.output_size_per_partition))
             self.bias.weight_loader = self.weight_loader
@@ -82,7 +84,7 @@ class ColumnParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
-
+# 
 class MergedColumnParallelLinear(ColumnParallelLinear):
 
     def __init__(
@@ -96,13 +98,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
+
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
-
+# QKV并行线性层
 class QKVParallelLinear(ColumnParallelLinear):
 
     def __init__(
@@ -125,7 +130,9 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
+
         assert loaded_shard_id in ["q", "k", "v"]
+        
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
@@ -139,7 +146,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
-
+# 行并行线性层
 class RowParallelLinear(LinearBase):
 
     def __init__(
