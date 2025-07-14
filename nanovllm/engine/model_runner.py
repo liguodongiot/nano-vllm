@@ -158,6 +158,7 @@ class ModelRunner:
 
         # 执行预填充阶段的推理
         self.run(seqs, True)
+
         torch.cuda.empty_cache()
 
     # 分配 KV 缓存
@@ -180,43 +181,89 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+    #  填充块表
     def prepare_block_tables(self, seqs: list[Sequence]):
+
+        # 计算序列块表的最大长度，确保所有序列的块表长度一致
         max_len = max(len(seq.block_table) for seq in seqs)
+
+        # 对每个序列的块表进行填充，使用-1填充至最大长度，保证所有序列块表长度一致
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        
+        # 将填充后的块表转换为张量，并移动到GPU上，以加速后续计算
+        # 使用 pin_memory=True 将其固定在内存中，以便在将数据传输到 GPU 时提高效率。
+        # 使用 .cuda(non_blocking=True) 将张量移动到 GPU 上，非阻塞模式允许其他操作在数据传输的同时继续进行。
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
         return block_tables
 
 
     def prepare_prefill(self, seqs: list[Sequence]):
+
+        # 收集所有序列的未缓存部分的输入 token ID
         input_ids = []
+        # 跟踪每个输入ID对应的位置信息
         positions = []
+
+        # query 序列的累积长度
         cu_seqlens_q = [0]
+        # key、value序列的累积长度 
         cu_seqlens_k = [0]
+
+        # query 序列的最大长度
         max_seqlen_q = 0
+        # key、value序列的最大长度
         max_seqlen_k = 0
+        
         slot_mapping = []
+        
         block_tables = None
+
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+
+            # Q通常表示当前需要处理的新的输入部分，它与之前的缓存部分（已经处理过的 token）相区分。
+            # 在预填充阶段，模型需要对新的输入进行处理和计算，因此，Q的长度应该只考虑新输入的 token 数量。
             seqlen_q = seqlen - seq.num_cached_tokens
+            # 在注意力机制中，K用于与Q进行匹配，以计算注意力分数。
+            # 在预填充阶段，通常需要考虑整个序列（包括缓存的 token）来计算注意力，因此，K的长度应该覆盖整个序列的 length（长度）。
             seqlen_k = seqlen
+
+            # 这种初始化方式确保了在预填充阶段，模型能够准确地处理新输入 token（通过查询长度），
+            # 同时又能利用整个序列的信息（通过键长度）来计算注意力，有效地平衡了计算效率和上下文信息的完整性。
+
+            
+            # 更新累积Q/K序列长度
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+
+            # 更新最大Q/K序列长度
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            
+
             if not seq.block_table:
                 continue
+            
+            # 计算块的起始与结束位置
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
+                # 将当前块的起始与结束位置添加到槽映射列表
                 slot_mapping.extend(list(range(start, end)))
+        
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+            # 需要使用前缀缓存
+            # 为序列填充块表
             block_tables = self.prepare_block_tables(seqs)
+        
+        # 转换为 PyTorch 张量，并使用 pin_memory=True 将其固定在内存中，以便在将数据传输到 GPU 时提高效率。
+        # 同时，使用非阻塞模式允许其他操作在数据传输的同时继续进行。
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -229,19 +276,29 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # input_ids列表收集每个序列的最后一个token
         input_ids = []
+        # positions列表记录每个序列的当前长度
         positions = []
+        # 存储每个序列最后一个token在块表中的映射位置
         slot_mapping = []
+        # 记录每个序列的上下文长度。
         context_lens = []
+        
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
+            # 根据当前序列块表的最后一个块索引位置乘以块大小，再加上该块中最后一个token的位置偏移量，得到该序列最后一个token在槽映射中的位置。
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+        
+        # 转换为 PyTorch 张量，并使用 pin_memory=True 将其固定在内存中，以便在将数据传输到 GPU 时提高效率。
+        # 同时，使用非阻塞模式允许其他操作在数据传输的同时继续进行。
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
         block_tables = self.prepare_block_tables(seqs)
 
         # 设置上下文
@@ -249,6 +306,7 @@ class ModelRunner:
         
         return input_ids, positions
 
+    # 为序列设置采样参数
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
@@ -256,15 +314,23 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    # 模型推理
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+
+        # 预填充阶段 或者 eager 模式 或者 input_ids.size(0) > 512 （cuda图的最大批处理现在在512以下）
+        # eager 模式，逐行执行代码，便于调试和动态控制流，但性能可能较低。
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # CUDA 图模式
             bs = input_ids.size(0)
+
             # 获取上下文
             context = get_context()
+
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+
             graph_vars = self.graph_vars
             for k, v in graph_vars.items():
                 if k != "outputs":
@@ -275,20 +341,25 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
+            
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    # TODO
+
     # 运行模型推理
+    # 预热模型以及每个step执行
     # is_prefill 是否是预填充阶段
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
 
+        # 预处理、设置上下文等
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         
+        # 为序列设置采样参数
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
 
         # 模型推理
         logits = self.run_model(input_ids, positions, is_prefill)
 
+        # rank 0 进行采样
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
 
         # 重置上下文
@@ -297,8 +368,12 @@ class ModelRunner:
         return token_ids
 
     """
+    CUDA 图是一种将 GPU 操作序列记录并优化的技术，可以减少 CPU 与 GPU 之间的交互开销，提升性能。
+
+    * 该函数为不同的 batch size 创建 CUDA 图，以便后续推理时可以直接复用这些图，提高推理速度。
+
     @torch.inference_mode() 作用：
-    自动关闭梯度计算（torch.set_grad_enabled(False)）。这可以显著减少内存占用和计算时间。
+    自动关闭梯度计算（torch.set_grad_enabled(False)），这可以显著减少内存占用和计算时间。
     改变特定层的行为：
     - Dropout：在训练模式下，Dropout 会随机丢弃一部分神经元的输出；而在推理模式下，Dropout 层会被禁用，所有神经元的输出都会被保留。
     - Batch Normalization：在训练模式下，Batch Normalization 会根据当前批次的数据计算均值和方差；在推理模式下，它会使用训练阶段计算的全局均值和方差（移动平均值）。
@@ -309,18 +384,29 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         
-        # 最大批处理大小
+        # 最大批处理大小，限制在512以内
         max_bs = min(self.config.max_num_seqs, 512)
 
         # 最大 KV cache 块数
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
-        # 初始化了一系列张量，用于存储输入数据、位置信息、映射信息、上下文长度、块表以及模型输出。
+        # 初始化了一系列张量，用于存储输入数据、位置信息、槽映射、上下文长度、块表以及模型输出。
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
+
+        # 槽映射
+        # 将每个 token 在逻辑序列中的位置映射到 KV Cache 中的物理存储位置（slot），通过这些 block 表，vLLM 可以计算出每个 token 在 KV Cache 中的具体位置，从而生成 slot_mapping。
+        # slot_mapping 就是用来指定每个 token 应该写入哪个 slot 的。
+        # 根据slot_mapping，在计算Attention时，会将k,v结果写回KV_CACHE，也就是block_table对应的地址中去。
+        # 参考 prepare_prefill、prepare_decode方法中，slot_mapping初始化逻辑。
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+
+        # 同一批次中每个序列的上下文长度
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
+
+        # 同一批次中每个序列的块表索引
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         # 定义了捕捉 CUDA graph 的批量大小列表
@@ -340,7 +426,7 @@ class ModelRunner:
             # 创建一个 CUDA 图实例
             graph = torch.cuda.CUDAGraph()
 
-            # 设置当前批量大小相关的上下文信息
+            # 设置当前批量大小相关的上下文信息，在进行模型推理时会使用到。
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             
             # 执行一次模型前向传播，确保模型加载到 GPU 上
@@ -359,8 +445,11 @@ class ModelRunner:
 
             # 确保所有 GPU 操作完成
             torch.cuda.synchronize()
-            # 重置上下文
+
+            # 重置上下文，防止不同 batch size 上下文污染
+            # 通常在每次 CUDA 图捕捉完成后调用，确保下一次捕捉时上下文是干净的。
             reset_context()
+
 
         self.graph_vars = dict(
             input_ids=input_ids,

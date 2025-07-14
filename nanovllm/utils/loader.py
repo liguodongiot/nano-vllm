@@ -32,7 +32,7 @@ def load_model(model: nn.Module, path: str):
             for weight_name in f.keys():
 
                 # 遍历打包模块映射
-                # packed_modules_mapping字典示例："v_proj": ("qkv_proj", "v")
+                # packed_modules_mapping 字典示例："v_proj": ("qkv_proj", "v")
                 for k in packed_modules_mapping:
                     # 如果当前权重名称包含映射中的键
                     if k in weight_name:

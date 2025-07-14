@@ -183,6 +183,15 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(nn.Module):
     
+    # 在 vLLM 中，为了极致的推理性能，经常会对权重进行量化（例如，将 FP16 的权重转换为 INT8/INT4）。
+    # 在量化过程中，多个原始的权重矩阵（如 Q、K、V 矩阵）可能会被合并（pack）成一个单一的、更大的量化后权重矩阵。
+    # 这样做可以优化内存访问和计算效率。
+
+    # packed_modules_mapping 的作用：这个字典就是用来描述这种“合并”关系的。
+    # 键 (key): 通常是合并后（packed）的权重在 safetensors 文件中的名称的一部分。例如，可能是 "q_proj"。
+    # 值 (value): 是一个元组 (v, shard_id)。
+    # - v: 对应模型中原始、未合并的参数名称的一部分。例如，可能是 "query_key_value"。
+    # - shard_id: 指示这个分片属于合并后大矩阵的哪个部分（例如，第0、1、2块分别对应Q、K、V）。
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -196,11 +205,19 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ) -> None:
         super().__init__()
+        
         self.model = Qwen3Model(config)
+
+        # 初始化一个 ParallelLMHead 实例，用于处理语言模型的输出层
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+
+        # 是否应绑定模型的输入和输出词嵌入
+        # 默认为true
         if config.tie_word_embeddings:
+             # 将 lm_head 的权重数据设置为模型的 embed_tokens 权重数据，实现权重共享
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
+    # TODO 
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -209,6 +226,7 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions)
         return hidden_states
 
+    # 执行完模型的forward方法之后，调用执行
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
