@@ -50,9 +50,9 @@ class VocabParallelEmbedding(nn.Module):
 
         # 从加载的权重中提取当前进程负责的部分
         # 按行切
-        # dim: _int
-        # start: Tensor 
-        # length: Union[_int, SymInt]
+        # dim: _int 切片维度
+        # start: Tensor 开始的索引
+        # length: Union[_int, SymInt] 切片长度
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         # 确保参数数据和加载的权重尺寸一致
         assert param_data.size() == loaded_weight.size()
